@@ -12,6 +12,10 @@
 - ``POST /api/revise``：提交与 ``/api/assemble`` 相同的有序 segments 及人工
   校订 edits（段序号、原文下标、替换字），沿逐字来源把校订定位到拼接文本并
   落实改字，返回修订后文本、沿用的逐字来源与逐位置修订记录。
+- ``POST /api/locate-quote``：提交与 ``/api/assemble`` 相同的有序 segments 及
+  1～80 字引文 quote，在拼接文本中以编辑代价（相同字或任一侧 ``?`` 代价 0，
+  替换/插入/删除代价 1）查找引文位置；唯一命中返回左闭右开区间、原文片段、
+  代价与该区间逐字 sources，多区间并列返回 409，无合格区间返回 422。
 """
 
 from fastapi import FastAPI, HTTPException
@@ -20,6 +24,10 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from .aligner import WILDCARD, align
 from .assembler import AssemblyError, assemble
 from .collator import collate
+from .locator import (
+    MAX_QUOTE_LEN as LOCATE_MAX_QUOTE_LEN,
+)
+from .locator import QuoteNotFoundError, QuoteTieError, locate_quote
 from .orderer import (
     MAX_SEGMENT_LEN as ORDER_MAX_SEGMENT_LEN,
 )
@@ -312,6 +320,38 @@ class ReviseResponse(BaseModel):
     )
 
 
+class LocateQuoteRequest(AssembleRequest):
+    """引文定位请求：与 /api/assemble 相同的有序 segments，外加引文 quote。"""
+
+    quote: str = Field(
+        ...,
+        min_length=1,
+        max_length=LOCATE_MAX_QUOTE_LEN,
+        description="待定位引文（1～80 字），未辨认字以 ? 表示，可与拼接文本中的 ? 免代价配对",
+        examples=["时习之"],
+    )
+
+
+class QuoteHit(BaseModel):
+    """引文在拼接文本中的一个命中区间。"""
+
+    start: int = Field(..., description="区间起点下标（含，从 0 开始）")
+    end: int = Field(..., description="区间终点下标（不含，左闭右开）")
+    fragment: str = Field(..., description="区间原文片段（拼接文本 [start, end)）")
+    cost: int = Field(..., description="引文与该区间对齐的最小代价")
+    sources: list[list[CharSource]] = Field(
+        ...,
+        description="该区间逐字来源列表，与 fragment 等长，规则与 /api/assemble 一致",
+    )
+
+
+class LocateQuoteResponse(QuoteHit):
+    """引文唯一命中时的定位结果。"""
+
+    text: str = Field(..., description="拼接文本（与 /api/assemble 的结果一致，不被改写）")
+    quote: str = Field(..., description="原样回显的引文")
+
+
 @app.get("/", summary="服务信息")
 def index():
     return {
@@ -321,6 +361,7 @@ def index():
         "collate": "POST /api/collate",
         "order": "POST /api/order",
         "revise": "POST /api/revise",
+        "locate_quote": "POST /api/locate-quote",
         "docs": "/docs",
         "health": "/health",
     }
@@ -549,5 +590,93 @@ def api_revise(req: ReviseRequest):
             detail={
                 "message": str(exc),
                 "conflicts": exc.conflicts,
+            },
+        ) from exc
+
+
+@app.post(
+    "/api/locate-quote",
+    response_model=LocateQuoteResponse,
+    status_code=200,
+    summary="在拼接文本中定位一段引文",
+    description=(
+        "请求沿用 `/api/assemble` 的 segments 限制（2～5 段、单段最长 500 字、"
+        "总长最长 800 字）与续接门槛（不满足返回 422 并给出 failed_segment），"
+        "另附 1～80 字的引文 `quote`。接口先复用其拼接得到文本与逐字来源，再把"
+        "引文与拼接文本的**任意非空连续区间**比较：相同字、或任一侧为 `?` 的"
+        "字符对代价 0；替换、插入、删除各代价 1。区间起点与终点均自由（引文必须"
+        "完全消耗），仅接受最小代价不超过 2 的区间。最小代价由多个**不同区间**"
+        "并列取得时返回 **409** 并按起点升序列出全部并列区间（各带原文片段、代价"
+        "与逐字 sources）；最小代价大于 2、无合格区间时返回 **422**。唯一命中时"
+        "返回左闭右开区间 [start, end)、原文片段 fragment、代价 cost 与该区间逐字"
+        "sources；接口只做定位，不改写拼接文本。"
+    ),
+    responses={
+        409: {
+            "description": "最小代价由多个不同区间并列取得，无法唯一定位",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": {
+                            "message": "引文在拼接文本中有 2 个不同区间以最小代价 0 并列，无法唯一定位",
+                            "cost": 0,
+                            "ties": [
+                                {
+                                    "start": 1,
+                                    "end": 2,
+                                    "fragment": "甲",
+                                    "cost": 0,
+                                    "sources": [[{"segment": 0, "pos": 1}]],
+                                },
+                                {
+                                    "start": 4,
+                                    "end": 5,
+                                    "fragment": "甲",
+                                    "cost": 0,
+                                    "sources": [[{"segment": 1, "pos": 0}]],
+                                },
+                            ],
+                        }
+                    }
+                }
+            },
+        },
+        422: {
+            "description": "续接失败、参数不合法，或无代价不超过 2 的合格区间",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": {
+                            "message": "引文（2 字）在拼接文本中最接近区间的代价为 3，超过 2，无合格区间"
+                        }
+                    }
+                }
+            },
+        },
+    },
+)
+def api_locate_quote(req: LocateQuoteRequest):
+    try:
+        return locate_quote(req.segments, req.quote)
+    except AssemblyError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(exc),
+                "failed_segment": exc.failed_segment,
+            },
+        ) from exc
+    except QuoteNotFoundError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": str(exc)},
+        ) from exc
+    except QuoteTieError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "cost": exc.cost,
+                "ties": exc.hits,
             },
         ) from exc

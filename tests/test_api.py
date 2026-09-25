@@ -417,3 +417,127 @@ def test_revise_gate_failure_returns_422_with_failed_segment():
     )
     assert resp.status_code == 422
     assert resp.json()["detail"]["failed_segment"] == 2
+
+
+def test_locate_quote_endpoint_unique_hit():
+    resp = client.post(
+        "/api/locate-quote",
+        json={
+            "segments": ["学而?习之", "时习之不", "之不亦乐乎"],
+            "quote": "时习之",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["text"] == "学而时习之不亦乐乎"
+    assert data["quote"] == "时习之"
+    assert data["start"] == 2 and data["end"] == 5
+    assert data["fragment"] == "时习之"
+    assert data["cost"] == 0
+    assert len(data["sources"]) == 3
+    # sources 与 /api/assemble 对应区间一致
+    assert data["sources"] == client.post(
+        "/api/assemble",
+        json={"segments": ["学而?习之", "时习之不", "之不亦乐乎"]},
+    ).json()["sources"][2:5]
+
+
+def test_locate_quote_endpoint_wildcard_and_cost():
+    # 任一侧 ? 代价 0
+    resp = client.post(
+        "/api/locate-quote",
+        json={"segments": ["甲?丙丁", "丙丁戊"], "quote": "甲乙丙丁"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["fragment"] == "甲?丙丁" and data["cost"] == 0
+
+    # 代价 1 的替换唯一命中
+    resp = client.post(
+        "/api/locate-quote",
+        json={
+            "segments": ["学而?习之", "时习之不", "之不亦乐乎"],
+            "quote": "学而时习之不亦悦乎",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["cost"] == 1
+    assert (resp.json()["start"], resp.json()["end"]) == (0, 9)
+
+
+def test_locate_quote_tie_returns_409():
+    resp = client.post(
+        "/api/locate-quote",
+        json={"segments": ["甲子丙丁卯", "丁卯甲庚"], "quote": "甲"},
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["cost"] == 0
+    assert [(t["start"], t["end"]) for t in detail["ties"]] == [(0, 1), (5, 6)]
+    for t in detail["ties"]:
+        assert t["fragment"] == "甲" and t["cost"] == 0
+        assert len(t["sources"]) == 1
+
+
+def test_locate_quote_no_match_returns_422():
+    resp = client.post(
+        "/api/locate-quote",
+        json={
+            "segments": ["学而?习之", "时习之不", "之不亦乐乎"],
+            "quote": "朋朋朋朋",
+        },
+    )
+    assert resp.status_code == 422
+    assert "message" in resp.json()["detail"]
+
+
+def test_locate_quote_gate_failure_returns_422_with_failed_segment():
+    resp = client.post(
+        "/api/locate-quote",
+        json={
+            "segments": ["孔子曰未知", "未知生焉", "完全无关文本"],
+            "quote": "孔子",
+        },
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["failed_segment"] == 2
+
+
+def test_locate_quote_reuses_assemble_segment_limits():
+    # 段数不足 / 超上限
+    assert client.post(
+        "/api/locate-quote", json={"segments": ["abc"], "quote": "a"}
+    ).status_code == 422
+    assert client.post(
+        "/api/locate-quote",
+        json={"segments": ["aa", "bb", "cc", "dd", "ee", "ff"], "quote": "a"},
+    ).status_code == 422
+    # 单段过长 / 总长超限 / 空段
+    assert client.post(
+        "/api/locate-quote",
+        json={"segments": ["a" * 500, "b" * 501], "quote": "a"},
+    ).status_code == 422
+    assert client.post(
+        "/api/locate-quote",
+        json={"segments": ["字" * 400, "字" * 401], "quote": "a"},
+    ).status_code == 422
+    assert client.post(
+        "/api/locate-quote", json={"segments": ["abc", ""], "quote": "a"}
+    ).status_code == 422
+
+
+def test_locate_quote_quote_length_validated():
+    base = {"segments": ["学而?习之", "时习之不"]}
+    # 缺 quote 字段
+    assert client.post("/api/locate-quote", json=base).status_code == 422
+    # 空 quote
+    assert client.post(
+        "/api/locate-quote", json={**base, "quote": ""}
+    ).status_code == 422
+    # 81 字
+    assert client.post(
+        "/api/locate-quote", json={**base, "quote": "字" * 81}
+    ).status_code == 422
+    # 恰好 80 字可通过参数校验（是否命中不影响 422 校验语义）
+    resp = client.post("/api/locate-quote", json={**base, "quote": "字" * 80})
+    assert resp.status_code in (200, 409, 422)
